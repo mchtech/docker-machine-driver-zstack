@@ -32,6 +32,7 @@ const (
 //	return &Driver{}
 //}
 
+//NewDriver :
 func NewDriver(hostName, storePath string) drivers.Driver {
 	return &Driver{
 		BaseDriver: &drivers.BaseDriver{
@@ -41,6 +42,7 @@ func NewDriver(hostName, storePath string) drivers.Driver {
 		}}
 }
 
+//Driver : ZStack docker-machine driver struct
 type Driver struct {
 	*drivers.BaseDriver
 	AccountName    string
@@ -61,6 +63,13 @@ type Driver struct {
 
 	L3NetworkNames string
 
+	PublicL3NetworkUUID string
+	PublicIPv4          string
+	PublicIPv4UUID      string
+	PrivateIPv4         string
+	PrivateIPAddress    string
+	PublicL3NetworkMode string
+
 	SystemDiskOffering string
 
 	DataDiskOffering string
@@ -71,6 +80,7 @@ type Driver struct {
 
 	InstanceUUID string
 
+	client                 *common.Client
 	instanceClient         *instance.Client
 	hostClient             *infrastructure.Host
 	imageClient            *instance.Image
@@ -83,6 +93,7 @@ type Driver struct {
 
 func (d *Driver) cleanup() error {
 	defer func() {
+		d.client = nil
 		d.hostClient = nil
 		d.imageClient = nil
 		d.clusterClient = nil
@@ -104,6 +115,8 @@ func (d *Driver) initClients() error {
 		log.Error(err)
 		return err
 	}
+	d.client = &commonClient
+
 	d.instanceClient = &instance.Client{
 		Client: commonClient,
 	}
@@ -142,7 +155,6 @@ func (d *Driver) getInstanceClient() *instance.Client {
 
 // Create a host using the driver's config
 func (d *Driver) Create() error {
-
 	var (
 		err error
 	)
@@ -162,7 +174,7 @@ func (d *Driver) Create() error {
 	request.Params.DataDiskOfferingUUIDs = d.getDataDisks()
 	request.Params.PrimaryStorageUUIDForRootVolume = d.PrimaryStorage
 	request.Params.HostUUID = d.PhysicalHost
-	async, err := d.instanceClient.CreateInstance(request)
+	async, err := d.getInstanceClient().CreateInstance(request)
 	if err != nil {
 		return errors.Wrap(err, "Get error when create vm instance in zstack.")
 	}
@@ -174,12 +186,49 @@ func (d *Driver) Create() error {
 		return errors.Wrap(response.Error.WrapError(), "Get error when create vm instance in zstack.")
 	}
 	d.InstanceUUID = response.Inventory.UUID
-
-	inventory, err := d.instanceClient.QueryInstance(d.InstanceUUID)
+	inventory, err := d.getInstanceClient().QueryInstance(d.InstanceUUID)
 	if err != nil {
 		return err
 	}
+	//set up public IP map
+	if d.PublicL3NetworkUUID != "" {
+		if len(inventory.VMNics) > 0 {
+
+			if strings.ToLower(d.PublicL3NetworkMode) == "portforward" {
+				d.PublicIPv4, d.PublicIPv4UUID, err = d.CreateVip()
+				if err != nil {
+					return err
+				}
+				for _, proto := range []string{"TCP", "UDP"} {
+					err = d.CreatePortForwardRule(d.PublicIPv4UUID, inventory.VMNics[0].UUID, proto)
+					if err != nil {
+						log.Errorf("error create portforwarding rules: %s", err.Error())
+						return err
+					}
+				}
+			} else if strings.ToLower(d.PublicL3NetworkMode) == "eip" {
+				d.PublicIPv4, d.PublicIPv4UUID, err = d.CreateVip()
+				if err != nil {
+					return err
+				}
+				err = d.CreateEip(d.PublicIPv4UUID, inventory.VMNics[0].UUID)
+				if err != nil {
+					log.Errorf("error create eip: %s", err.Error())
+					return err
+				}
+			} else {
+
+			}
+		}
+	}
+
 	d.IPAddress = d.getIP(inventory)
+	d.PublicIPv4 = d.IPAddress
+	d.PrivateIPAddress, _ = d.GetInternalIP()
+	d.PrivateIPv4 = d.PrivateIPAddress
+
+	log.Debugf("IP Address: %s, %s; %s, %s.", d.PublicIPv4, d.IPAddress, d.PrivateIPv4, d.PrivateIPAddress)
+
 	if d.SSHUser == "" {
 		d.SSHUser = sshUser
 	}
@@ -264,6 +313,7 @@ func (d *Driver) autoFdisk(sshClient ssh.Client) {
 
 func (d *Driver) configInstance() error {
 	ipAddr := d.IPAddress
+	//ipAddr := d.PrivateIPAddress
 	port, _ := d.GetSSHPort()
 	tcpAddr := fmt.Sprintf("%s:%d", ipAddr, port)
 
@@ -397,6 +447,18 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			EnvVar: "ZSTACK_SSH_PASSWORD",
 			Value:  "",
 		},
+		mcnflag.StringFlag{
+			Name:   "zstack-public-network",
+			Usage:  "Optional. Specify the public network uuid for EIP or PortForward mode.",
+			EnvVar: "ZSTACK_PUBLIC_NETWORK",
+			Value:  "",
+		},
+		mcnflag.StringFlag{
+			Name:   "zstack-network-mode",
+			Usage:  "EIP, PortForward, Flat (Default)",
+			EnvVar: "ZSTACK_NETWORK_MODE",
+			Value:  "",
+		},
 	}
 }
 
@@ -413,12 +475,14 @@ func (d *Driver) GetIP() (string, error) {
 // GetSSHHostname returns hostname for use with ssh
 func (d *Driver) GetSSHHostname() (string, error) {
 	return d.GetIP()
+	//return d.GetInternalIP()
 }
 
 // GetURL returns a Docker compatible host URL for connecting to this host
 // e.g. tcp://1.2.3.4:2376
 func (d *Driver) GetURL() (string, error) {
 	ip, err := d.GetIP()
+	//ip, err := d.GetInternalIP()
 	if err != nil {
 		return "", err
 	}
@@ -459,7 +523,7 @@ func (d *Driver) GetState() (state.State, error) {
 
 // Kill stops a host forcefully
 func (d *Driver) Kill() error {
-	async, err := d.instanceClient.StopInstance(d.InstanceUUID, instance.StopInstanceTypeCold)
+	async, err := d.getInstanceClient().StopInstance(d.InstanceUUID, instance.StopInstanceTypeCold)
 	if err != nil {
 		return errors.Wrap(err, "Get error when sending kill instance request.")
 	}
@@ -490,6 +554,11 @@ func (d *Driver) PreCreateCheck() error {
 
 // Remove a host
 func (d *Driver) Remove() error {
+	//Zero delete vip (automatically remove portforward rules and eip)
+	if d.PublicL3NetworkUUID != "" && (strings.ToLower(d.PublicL3NetworkMode) == "eip" || strings.ToLower(d.PublicL3NetworkMode) == "portforward") {
+		d.DeleteVip()
+	}
+
 	//First delete it
 	async, err := d.getInstanceClient().DeleteInstance(d.InstanceUUID)
 	if err != nil {
@@ -515,7 +584,6 @@ func (d *Driver) Remove() error {
 	if responseStruct.Error != nil {
 		return errors.Wrap(responseStruct.Error.WrapError(), "Get error when expunge zstack instance.")
 	}
-
 	return nil
 }
 
@@ -561,6 +629,14 @@ func (d *Driver) SetConfigFromFlags(opts drivers.DriverOptions) error {
 		return errors.Errorf("The network configuration is required.")
 	}
 
+	d.PublicL3NetworkUUID = opts.String("zstack-public-network")
+	d.PublicL3NetworkMode = opts.String("zstack-network-mode")
+	if d.PublicL3NetworkMode == "" {
+		return errors.Errorf("The L3 network mode is required.")
+	}
+	if strings.ToLower(d.PublicL3NetworkMode) != "flat" && d.PublicL3NetworkUUID == "" {
+		return errors.Errorf("The public L3 network UUID is required when network mode is not FlatNetwork.")
+	}
 	//if the image is the type of ISO, then this argument is required
 	d.SystemDiskOffering = opts.String("zstack-system-disk-offering")
 	if d.SystemDiskOffering == "" {
@@ -618,8 +694,28 @@ func (d *Driver) Stop() error {
 }
 
 func (d *Driver) getIP(instance *instance.VMInstanceInventory) string {
+	//log.Infof("Try to return PublicIPv4: %s", d.PublicIPv4)
+	if d.PublicIPv4 != "" {
+		return d.PublicIPv4
+	}
+	// PublicIPv4, _, _ := d.QueryVipIPUUID()
+	// if PublicIPv4 != "" {
+	// 	return PublicIPv4
+	// }
 	if len(instance.VMNics) > 0 {
 		return instance.VMNics[0].IP
 	}
 	return ""
+}
+
+//GetInternalIP will get vm private ip rather than public ip
+func (d *Driver) GetInternalIP() (string, error) {
+	inventory, err := d.getInstanceClient().QueryInstance(d.InstanceUUID)
+	if err != nil {
+		return "", errors.Wrap(err, "Error when getting instance.")
+	}
+	if len(inventory.VMNics) > 0 {
+		return inventory.VMNics[0].IP, nil
+	}
+	return "", errors.Errorf("IP not found")
 }
