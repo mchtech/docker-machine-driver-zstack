@@ -2,6 +2,7 @@ package zstack
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/docker/machine/libmachine/drivers"
@@ -79,6 +80,9 @@ type Driver struct {
 	SSHPassword string
 
 	InstanceUUID string
+
+	PreCustomScriptDownloadURL  string
+	PostCustomScriptDownloadURL string
 
 	client                 *common.Client
 	instanceClient         *instance.Client
@@ -169,6 +173,9 @@ func (d *Driver) Create() error {
 	request.Params.ClusterUUID = d.ClusterName
 	request.Params.ImageUUID = d.ImageName
 	request.Params.L3NetworkUuids = d.getNetworks()
+	// L3NetworkNames Param is not a optional param.
+	request.Params.DefaultL3NetworkUUID = request.Params.L3NetworkUuids[0]
+
 	request.Params.InstanceOfferingUUID = d.InstanceOffering
 	request.Params.RootDiskOfferingUUID = d.SystemDiskOffering
 	request.Params.DataDiskOfferingUUIDs = d.getDataDisks()
@@ -200,7 +207,7 @@ func (d *Driver) Create() error {
 					return err
 				}
 				for _, proto := range []string{"TCP", "UDP"} {
-					err = d.CreatePortForwardRule(d.PublicIPv4UUID, inventory.VMNics[0].UUID, proto)
+					err = d.CreatePortForwardRule(d.PublicIPv4UUID, d.findDefaultNetworkVMNic(inventory.VMNics).UUID, proto)
 					if err != nil {
 						log.Errorf("error create portforwarding rules: %s", err.Error())
 						return err
@@ -211,7 +218,7 @@ func (d *Driver) Create() error {
 				if err != nil {
 					return err
 				}
-				err = d.CreateEip(d.PublicIPv4UUID, inventory.VMNics[0].UUID)
+				err = d.CreateEip(d.PublicIPv4UUID, d.findDefaultNetworkVMNic(inventory.VMNics).UUID)
 				if err != nil {
 					log.Errorf("error create eip: %s", err.Error())
 					return err
@@ -311,6 +318,61 @@ func (d *Driver) autoFdisk(sshClient ssh.Client) {
 	log.Infof("%s | Auto Fdisk command err, output: %v: %s", d.MachineName, err, output)
 }
 
+func (d *Driver) customInitScript(sshClient ssh.Client, stage string) {
+	scriptURL := d.PreCustomScriptDownloadURL
+	if stage == "post" {
+		scriptURL = d.PostCustomScriptDownloadURL
+	}
+	tagfile := "/.CUSTOM_INIT_FINISH_" + stage
+
+	log.Infof("url: %s", scriptURL)
+
+	output, err := sshClient.Output("ls /.CUSTOM_INIT_FINISH_" + stage)
+	log.Infof("%s-custom init tagfile on %s: %s", stage, d.MachineName, output)
+
+	if output == tagfile {
+		log.Infof("%s-custom init script has been executed on %s", stage, d.MachineName)
+	} else {
+		output, err = sshClient.Output(fmt.Sprintf("curl %s > ~/machine_%s_customscript.sh", scriptURL, stage))
+		log.Infof("%s-custom init script download: %s, error: %s", stage, output, err)
+		var (
+			stdout         io.ReadCloser
+			stderr         io.ReadCloser
+			outstr, errstr []byte
+			cmd, touchcmd  string
+		)
+		if d.SSHUser == "root" {
+			cmd = fmt.Sprintf("sh ~/machine_%s_customscript.sh", stage)
+			touchcmd = "touch " + tagfile
+		} else {
+			cmd = fmt.Sprintf("sudo su root ~/machine_%s_customscript.sh", stage)
+			touchcmd = fmt.Sprintf("sudo su root -c 'touch %s'", tagfile)
+		}
+		if stdout, stderr, err = sshClient.Start(cmd); err == nil {
+			go func() {
+				if stdout != nil {
+					outstr, _ = ioutil.ReadAll(stdout)
+					stdout.Close()
+				}
+				if stderr != nil {
+					errstr, _ = ioutil.ReadAll(stderr)
+					stderr.Close()
+				}
+				log.Infof("%s-custom init script output and error: %s \n====================%s", stage, string(outstr), string(errstr))
+			}()
+
+			err = sshClient.Wait()
+			// support reboot
+			//golang 1.10 golang.org/x/crypto/ssh.ExitMissingError
+			//if _, ok := err.(*ssh2.ExitMissingError); err == nil || ok {
+			if err == nil || err.Error() == "wait: remote command exited without exit status or exit signal" {
+				output, err = sshClient.Output(touchcmd)
+			}
+		}
+		log.Infof("%s | %s-custom Init Script command err, output: %v: %s", d.MachineName, stage, err, output)
+	}
+}
+
 func (d *Driver) configInstance() error {
 	ipAddr := d.IPAddress
 	//ipAddr := d.PrivateIPAddress
@@ -336,8 +398,27 @@ func (d *Driver) configInstance() error {
 		return err
 	}
 
-	d.autoFdisk(sshClient)
+	if d.PreCustomScriptDownloadURL != "" {
+		if sshClient, err := ssh.NewClient(d.GetSSHUsername(), ipAddr, port, &auth); err == nil {
+			d.customInitScript(sshClient, "pre")
+		} else {
+			return err
+		}
+	}
 
+	if sshClient, err := ssh.NewClient(d.GetSSHUsername(), ipAddr, port, &auth); err == nil {
+		d.autoFdisk(sshClient)
+	} else {
+		return err
+	}
+
+	if d.PostCustomScriptDownloadURL != "" {
+		if sshClient, err := ssh.NewClient(d.GetSSHUsername(), ipAddr, port, &auth); err == nil {
+			d.customInitScript(sshClient, "post")
+		} else {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -455,8 +536,20 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 		},
 		mcnflag.StringFlag{
 			Name:   "zstack-network-mode",
-			Usage:  "EIP, PortForward, Flat (Default)",
+			Usage:  "Optional. EIP, PortForward, Flat (Default)",
 			EnvVar: "ZSTACK_NETWORK_MODE",
+			Value:  "",
+		},
+		mcnflag.StringFlag{
+			Name:   "zstack-pre-custominitscript-url",
+			Usage:  "Optional. Specify the Pre-Custom Init Script Download URL",
+			EnvVar: "ZSTACK_PRE_INIT_URL",
+			Value:  "",
+		},
+		mcnflag.StringFlag{
+			Name:   "zstack-post-custominitscript-url",
+			Usage:  "Optional. Specify the Post-Custom Init Script Download URL",
+			EnvVar: "ZSTACK_POST_INIT_URL",
 			Value:  "",
 		},
 	}
@@ -632,11 +725,15 @@ func (d *Driver) SetConfigFromFlags(opts drivers.DriverOptions) error {
 	d.PublicL3NetworkUUID = opts.String("zstack-public-network")
 	d.PublicL3NetworkMode = opts.String("zstack-network-mode")
 	if d.PublicL3NetworkMode == "" {
-		return errors.Errorf("The L3 network mode is required.")
+		//return errors.Errorf("The L3 network mode is required.")
+		d.PublicL3NetworkMode = "flat"
 	}
 	if strings.ToLower(d.PublicL3NetworkMode) != "flat" && d.PublicL3NetworkUUID == "" {
 		return errors.Errorf("The public L3 network UUID is required when network mode is not FlatNetwork.")
 	}
+	d.PreCustomScriptDownloadURL = opts.String("zstack-pre-custominitscript-url")
+	d.PostCustomScriptDownloadURL = opts.String("zstack-post-custominitscript-url")
+
 	//if the image is the type of ISO, then this argument is required
 	d.SystemDiskOffering = opts.String("zstack-system-disk-offering")
 	if d.SystemDiskOffering == "" {
@@ -703,7 +800,7 @@ func (d *Driver) getIP(instance *instance.VMInstanceInventory) string {
 	// 	return PublicIPv4
 	// }
 	if len(instance.VMNics) > 0 {
-		return instance.VMNics[0].IP
+		return d.findDefaultNetworkVMNic(instance.VMNics).IP
 	}
 	return ""
 }
@@ -715,7 +812,7 @@ func (d *Driver) GetInternalIP() (string, error) {
 		return "", errors.Wrap(err, "Error when getting instance.")
 	}
 	if len(inventory.VMNics) > 0 {
-		return inventory.VMNics[0].IP, nil
+		return d.findDefaultNetworkVMNic(inventory.VMNics).IP, nil
 	}
 	return "", errors.Errorf("IP not found")
 }

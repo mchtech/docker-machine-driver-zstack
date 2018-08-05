@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/cnrancher/go-zstack/common"
+	"github.com/cnrancher/go-zstack/instance"
 	"github.com/pkg/errors"
 )
 
@@ -249,6 +250,17 @@ func (d *Driver) CreatePortForwardRule(vipuuid string, vmnicuuid string, proto s
 	return nil
 }
 
+func (d *Driver) findDefaultNetworkVMNic(vmnics []*instance.VMNic) *instance.VMNic {
+	// L3NetworkNames Param is not a optional param.
+	defaultL3UUID := d.getNetworks()[0]
+	for _, nic := range vmnics {
+		if nic.L3NetworkUUID == defaultL3UUID {
+			return nic
+		}
+	}
+	return nil
+}
+
 //QueryVipIPUUID will return vip and its uuid of current instance
 func (d *Driver) QueryVipIPUUID() (string, string, error) {
 	d.initClients()
@@ -259,7 +271,8 @@ func (d *Driver) QueryVipIPUUID() (string, string, error) {
 	if len(inventory.VMNics) == 0 {
 		return "", "", fmt.Errorf("Nics not found")
 	}
-	GuestIP := inventory.VMNics[0].IP
+
+	GuestIP := d.findDefaultNetworkVMNic(inventory.VMNics).IP
 	var realURI string
 
 	if strings.ToLower(d.PublicL3NetworkMode) == "portforward" {
